@@ -1,0 +1,198 @@
+.chessly-card {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  width: 300px;
+  z-index: 2147483001;
+  box-sizing: border-box;
+  background: #1c1c1e;
+  color: #f5f5f7;
+  border-radius: 18px;
+  padding: 14px 16px 16px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.45);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  user-select: none;
+  line-height: 1.3;
+}
+
+.chessly-card * {
+  box-sizing: border-box;
+}
+
+.chessly-handle {
+  cursor: grab;
+}
+
+.chessly-handle:active {
+  cursor: grabbing;
+}
+
+.chessly-kicker {
+  margin: 0 0 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #8e8e93;
+}
+
+.chessly-notice {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: #f5f5f7;
+}
+
+.chessly-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.chessly-segment,
+.chessly-lines {
+  display: flex;
+  align-items: center;
+  background: #111113;
+  border-radius: 999px;
+  padding: 3px;
+  gap: 2px;
+}
+
+.chessly-segment button,
+.chessly-lines button {
+  border: 0;
+  margin: 0;
+  background: transparent;
+  color: #8e8e93;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.chessly-segment button {
+  flex: 1;
+  padding: 8px 10px;
+}
+
+.chessly-lines button {
+  width: 30px;
+  height: 26px;
+  padding: 0;
+  font-weight: 600;
+}
+
+.chessly-segment button[aria-pressed="true"],
+.chessly-lines button[aria-pressed="true"] {
+  background: #e5e5ea;
+  color: #1c1c1e;
+  font-weight: 700;
+}
+
+.chessly-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+}
+
+.chessly-label {
+  font-size: 14px;
+  font-weight: 500;
+  color: #f5f5f7;
+}
+
+.chessly-readout {
+  color: #8e8e93;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.chessly-elo-block[data-active="false"] {
+  opacity: 0.45;
+}
+
+.chessly-card input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  margin: 10px 0 0;
+  border-radius: 999px;
+  background: #3a3a3c;
+  outline: none;
+}
+
+.chessly-card input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 50%;
+  background: #f5f5f7;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+}
+
+.chessly-card input[type="range"]::-moz-range-thumb {
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 50%;
+  background: #f5f5f7;
+  cursor: pointer;
+}
+
+.chessly-switch {
+  position: relative;
+  width: 51px;
+  height: 31px;
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 31px;
+  padding: 0;
+  background: #3a3a3c;
+  cursor: pointer;
+}
+
+.chessly-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 27px;
+  height: 27px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  transition: transform 0.2s ease;
+}
+
+.chessly-switch[aria-checked="true"] {
+  background: #34c759;
+}
+
+.chessly-switch[aria-checked="true"]::after {
+  transform: translateX(20px);
+}
+
+.chessly-status {
+  margin: 0;
+  min-height: 16px;
+  font-size: 12px;
+  color: #8e8e93;
+}
+
+.chessly-engine {
+  margin: -8px 0 0;
+  min-height: 12px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: #636366;
+}

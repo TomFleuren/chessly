@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "Chessly",
+  "version": "1.0.0",
+  "description": "Move hints on chess.com — computer bots only, never against humans.",
+  "minimum_chrome_version": "114",
+  "permissions": ["storage", "offscreen", "tabs", "webNavigation"],
+  "host_permissions": ["https://www.chess.com/*", "https://chess.com/*"],
+  "background": {
+    "service_worker": "dist/background.js"
+  },
+  "action": {
+    "default_title": "Chessly",
+    "default_popup": "src/popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.chess.com/*", "https://chess.com/*"],
+      "js": ["dist/content.js"],
+      "css": ["src/content/panel.css"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "engine/stockfish-19-lite-single.js",
+        "engine/stockfish-19-lite-single.wasm"
+      ],
+      "matches": ["https://www.chess.com/*", "https://chess.com/*"]
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "chessly@chessly.extension",
+      "strict_min_version": "128.0"
+    }
+  }
+}
