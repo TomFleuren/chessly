@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Play Bots</title>
+    <style>
+      html, body { margin: 0; background: #262421; color: #eee; font-family: system-ui, sans-serif; }
+      #layout { display: flex; gap: 24px; padding: 24px; }
+      #board-layout-chessboard > .board {
+        display: block;
+        position: relative;
+        width: 480px;
+        height: 480px;
+        background: #769656;
+      }
+      .piece { position: absolute; width: 60px; height: 60px; }
+      .player-top, .clock-bottom, .clock-top { display: block; }
+      [data-cy="bot-name"] { display: block; width: 160px; height: 24px; }
+    </style>
+  </head>
+  <body>
+    <div id="layout">
+      <div>
+        <div class="player-top player-component">
+          <span data-cy="bot-name">Nora (2200)</span>
+        </div>
+        <div class="clock-top" style="width: 80px; height: 28px"></div>
+        <div id="board-layout-chessboard">
+          <wc-chess-board class="board" id="board"></wc-chess-board>
+        </div>
+        <div class="clock-bottom clock-player-turn" style="width: 80px; height: 28px"></div>
+        <div class="player-bottom player-component" style="width: 160px; height: 28px">netdumper</div>
+      </div>
+      <wc-simple-move-list>
+        <div class="node">e4</div>
+        <div class="node">e5</div>
+      </wc-simple-move-list>
+    </div>
+    <script>
+      const board = document.getElementById("board");
+      const back = ["r", "n", "b", "q", "k", "b", "n", "r"];
+      for (let file = 1; file <= 8; file += 1) {
+        add("w", back[file - 1], file, 1);
+        add("w", "p", file, file === 5 ? 4 : 2);
+        add("b", "p", file, file === 5 ? 5 : 7);
+        add("b", back[file - 1], file, 8);
+      }
+      function add(color, type, file, rank) {
+        const piece = document.createElement("div");
+        piece.className = `piece ${color}${type} square-${file}${rank}`;
+        const square = 60;
+        piece.style.left = `${(file - 1) * square}px`;
+        piece.style.top = `${(8 - rank) * square}px`;
+        board.appendChild(piece);
+      }
+    </script>
+  </body>
+</html>

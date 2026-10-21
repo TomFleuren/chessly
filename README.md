@@ -74,20 +74,18 @@ Every FEN is passed through chess.js before it is sent to Stockfish. Stockfish 1
 
 Official Stockfish 19 builds WebAssembly, but the GitHub release only publishes native binaries. The full Stockfish.js WASM file is about 94 MB, and the multi-threaded builds need cross-origin isolation (`SharedArrayBuffer`), which an extension page on chess.com does not have. The lite single-threaded build is the Stockfish 19 WASM build that runs inside the extension. It is weaker than full Stockfish 19 and still far stronger than a human.
 
-On Chrome the worker lives in an offscreen document so chess.com’s page CSP cannot block it. The content script never links to an external engine.
+On Chrome the worker lives in an offscreen document, the same idea as [A.C.A.S](https://github.com/Psyyke/A.C.A.S) keeping the engine off the chess page: chess.com’s page CSP cannot see or block the WASM worker. The content script only reads the board and draws the hint. It does not start the worker itself. Chrome does not expose `chrome.offscreen` to content scripts, so an earlier build fell through to `new Worker` inside the page, the worker never came up, and the status line kept saying “Calculating hint…”. A failed or timed-out search now stays on a visible error (`Engine failed to start`, `Engine did not respond`, `Hint timed out`, or `Engine rejected the position`) and the page console logs lines prefixed with `[Chessly]`.
 
 ## Human move mode
 
-The Elo slider is a **Lichess-style rating from 800 to 2500**, not Stockfish’s `UCI_Elo` option. On this build `UCI_Elo` only accepts 1320–3190 and is a different scale, so it cannot represent the lower end of the slider.
+The Elo slider is a Lichess-style rating from 800 to 2500. Human move mode follows A.C.A.S `setEngineElo` / `GET_DEPTH_FROM_ELO`:
 
-Human move mode still searches at full strength (the badge stays an honest evaluation) with MultiPV, then samples one candidate with a softmax over centipawn gaps:
+- Search depth is 1 at 800, 3 at 1700, 6 at 2310, and 7 at 2500.
+- At or below 2300, and only when the rating is inside this build’s `UCI_Elo` range (1320–3190), Chessly sets `UCI_Elo` and `UCI_LimitStrength`. `UCI_Elo` is set before limit-strength is turned on.
+- Above 2300 the search stays full strength and just stops at that depth. 2310 is in this band.
+- Ratings below 1320 are not sent as `UCI_Elo`. This build rejects values outside 1320–3190, and Skill Level no longer exists in Stockfish 19, so a low rating is depth 1 only.
 
-```
-temperature(elo) = 15 + 145 * exp(-(elo - 800) / 700)
-weight(move)     = exp(-(bestCp - moveCp) / temperature)
-```
-
-Approximate temperatures: 800 → 160cp, 1700 → 55cp, 2500 → 28cp. A 2500-rated sample almost always plays the best move. An 800-rated sample often plays a noticeably worse one. The sampled move is the one drawn with brackets; the other lines, if requested, are the remaining engine candidates.
+Best move mode ignores the slider and searches at full strength for 700 ms. In both modes the first engine line is the bracketed move. Extra lines are the next MultiPV results. The badge is that line’s evaluation from the side to move.
 
 ## Develop
 
@@ -97,12 +95,14 @@ npm test
 npm run build   # rewrites dist/ after source changes
 ```
 
-Tests cover the URL allowlist (including encoded `..` escapes), the human-game DOM veto, FEN extraction from piece classes and move lists, overlay geometry, human-move sampling, and a smoke test that the bundled engine identifies itself as Stockfish 19 Lite and returns a move.
+Tests cover the URL allowlist (including encoded `..` escapes), the human-game DOM veto, FEN extraction, the chess.com piece/orientation tracker, the rated-search commands, overlay geometry, and a smoke test that Stockfish 19 Lite returns a move for both a full-strength search and the Elo 2310 / 1700 human-move settings.
 
 ## License
 
 Chessly is **GPL-3.0-only** because it includes Stockfish. See `LICENSE`, `engine/COPYING.txt`, and `THIRD_PARTY_NOTICES.md`. chess.js is BSD-2-Clause.
 
+Board reading, the depth-from-Elo table, and the “engine off the chess page” split are adapted from [A.C.A.S](https://github.com/Psyyke/A.C.A.S) by Hakorr / Psyyke, also GPL-3.0. Chessly does not include A.C.A.S’s multi-site support, live or daily games, or automatic moving. The hint graphics stay the Chessly brackets and eval badge.
+
 ## What this repository cannot verify by itself
 
-chess.com sits behind a bot check, and its board markup is not published as a stable API. Selectors (`wc-chess-board`, `.piece`, `square-XY`, `#board-play-computer`, `.clock-top` / `.clock-bottom`, `board.game.getFEN`) match the DOM chess.com has used recently, and the extension prefers the internal FEN when it is present. If chess.com renames those nodes, piece reading or the bot-marker confirmation can miss until the selectors are updated. The URL allowlist does not depend on those names. The overlay alignment, flip handling, and resize tracking are implemented against `getBoundingClientRect` and the `flipped` class, and were not exercised on a live logged-in bot game in this environment.
+chess.com sits behind a bot check, and its board markup is not published as a stable API. Selectors follow the chess.com path in A.C.A.S: `#board-layout-chessboard > .board`, `.piece` with `(b|w)[prnbqk]` and `square-XY`, and the `flipped` class. `wc-chess-board` / `board.game.getFEN()` is still preferred when chess.com exposes it and it matches the pieces. If chess.com renames those nodes, piece reading or the bot-marker confirmation can miss until the selectors are updated. The URL allowlist does not depend on those names.

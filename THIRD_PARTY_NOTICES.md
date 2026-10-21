@@ -12,6 +12,23 @@ Stockfish 19 (tag `sf_19`) and the Stockfish.js 19.0.1 WebAssembly build in
 
 Chessly as a whole is GPL-3.0-only because it includes this engine.
 
+## A.C.A.S
+
+Board reading for chess.com, the Elo-to-depth table, and the decision to keep
+the engine off the chess page are adapted from A.C.A.S (Advanced Chess
+Assistance System) by Hakorr / Psyyke:
+
+- https://github.com/Psyyke/A.C.A.S
+- https://greasyfork.org/en/scripts/459137-1-chess-assistant-a-c-a-s-advanced-chess-assistance-system
+
+A.C.A.S is GNU GPL-3.0, the same license as Chessly. The adapted pieces are
+`GET_DEPTH_FROM_ELO`, the `UCI_Elo` / `UCI_LimitStrength` cutoff at 2300 from
+`setEngineElo`, and the chess.com rules in `acas.user.js` (`#board-layout-chessboard > .board`,
+piece classes `square-(\d)(\d)`, the `flipped` orientation, and one-move
+castling / en-passant updates). Chessly does not copy the userscript, the
+multi-site adapters, live or daily game support, or automatic move playing.
+Hint graphics are Chessly’s own brackets and eval badge.
+
 ## chess.js
 
 chess.js 1.4.0 is used to validate FENs and replay move lists. It is

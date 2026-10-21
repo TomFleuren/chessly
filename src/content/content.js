@@ -1,6 +1,7 @@
 import { Chess } from "chess.js";
 import { BOT_ONLY_NOTICE } from "../allowlist.js";
 import { classifySignals, inferPlayingAs, readDomSignals } from "../bot-dom.js";
+import { basicFromPieces, boardOrientation, createPositionTracker, findChessComBoard, readPieceElements } from "../chesscom-board.js";
 import { createEngineClient } from "../engine-client.js";
 import {
   extractFen,
@@ -10,14 +11,16 @@ import {
   squareFromClass,
   turnFromClocks,
 } from "../fen.js";
+import { failureText, hintStatusText, statusMayRefresh } from "../hint-status.js";
 import { selectDisplayedMoves } from "../human.js";
 import { renderOverlaySvg } from "../overlay.js";
+import { BEST_MOVETIME_MS, searchCommands } from "../rating.js";
 import { DEFAULT_SETTINGS, sameSettings, sanitizeSettings, STORAGE_KEY } from "../settings.js";
 import { createSearchCollector, fenKey, formatEval } from "../uci.js";
 
-const MOVETIME_MS = 700;
-const HUMAN_POOL = 5;
+const LOG = "[Chessly]";
 const START_PLACEMENT = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+const HINT_DEADLINE_MS = 25000;
 
 if (!globalThis.__CHESSLY_BOOTED__) {
   globalThis.__CHESSLY_BOOTED__ = true;
@@ -46,6 +49,7 @@ function boot() {
   let lastPool = null;
   let displayMoves = null;
   let showing = false;
+  let phase = "idle";
   let overlay = null;
   let trackRaf = 0;
   let boardObserver = null;
@@ -78,13 +82,27 @@ function boot() {
   chrome.runtime?.onMessage.addListener((message) => {
     if (message?.target !== "content") return;
     if (message.type === "DEACTIVATE") deactivate();
-    if (message.type === "ENGINE_ERROR") panel.setStatus("Engine restarted");
+    if (message.type === "ENGINE_ERROR") {
+      console.error(LOG, "engine:", message.detail || "unknown");
+      dropEngine();
+      if (activated && userToMove && phase !== "ready") {
+        failHint(failureText(message.detail || "engine error"), message.detail);
+      }
+    }
   });
+
+  const positionTracker = createPositionTracker();
+  let lastGateKey = "";
+  let deadlineTimer = 0;
+  // Declared before the first reconcile(). A later `let` is still in the
+  // temporal dead zone while that call runs, which aborted the search and
+  // left the status on "Calculating hint…".
+  let cache = null;
 
   installNavigationHooks(() => reconcile());
   const pollTimer = setInterval(() => reconcile(), 250);
   const statusTimer = setInterval(() => {
-    if (!activated || !userToMove || showing) return;
+    if (!activated || !statusMayRefresh(phase) || !userToMove || showing) return;
     panel.setStatus(waitingStatus());
   }, 250);
 
@@ -99,6 +117,15 @@ function boot() {
   function reconcile() {
     const signals = readDomSignals(document);
     const gate = classifySignals({ url: location.href, ...signals });
+    const gateKey = `${gate.activate}|${gate.reason}|${location.pathname}`;
+    if (gateKey !== lastGateKey) {
+      lastGateKey = gateKey;
+      console.info(LOG, "gate", gate.reason, location.href, {
+        bot: signals.hasBotMarker,
+        human: signals.hasHumanMarker,
+        botSeat: signals.botSeat,
+      });
+    }
     if (!gate.activate) {
       deactivate();
       return;
@@ -109,7 +136,7 @@ function boot() {
       panel.apply(settings);
     }
 
-    const position = readPosition(signals);
+    const position = readPosition(signals, positionTracker);
     if (!position) return;
 
     if (position.signature !== lastSignature) {
@@ -143,18 +170,32 @@ function boot() {
     lastPool = null;
     displayMoves = null;
     hintedSignature = "";
+    phase = "idle";
     clearHintVisuals();
     userToMove = Boolean(playingAs) && position.turn === playingAs;
+    console.info(LOG, "position", {
+      fen: position.fen,
+      source: position.source,
+      turn: position.turn,
+      playingAs,
+      orientation: position.orientation,
+      userToMove,
+      mode: settings.mode,
+      elo: settings.elo,
+    });
 
     if (!userToMove) {
       turnStarted = 0;
+      phase = "idle";
       panel.setStatus(playingAs ? "Opponent's turn" : "Detecting your color…");
       if (settings.analyzeOpponent && playingAs) void precompute(position.fen, searchToken);
       else void idleEngine();
       return;
     }
 
+    phase = "countdown";
     turnStarted = performance.now();
+    armDeadline(searchToken);
     const cached = cacheHit(position.fen);
     if (cached) {
       lastPool = cached;
@@ -167,8 +208,6 @@ function boot() {
     scheduleHint();
     void searchForUser(position.fen, searchToken);
   }
-
-  let cache = null;
 
   function cacheHit(fen) {
     if (!cache || cache.key !== fenKey(fen)) return null;
@@ -216,16 +255,34 @@ function boot() {
 
   function scheduleHint() {
     clearTimeout(hintTimer);
-    if (!activated || !userToMove) return;
+    if (!activated || !userToMove || phase === "error") return;
     const wait = Math.max(0, settings.hintDelaySec * 1000 - (performance.now() - turnStarted));
     hintTimer = setTimeout(() => {
-      if (!activated || !userToMove) return;
+      if (!activated || !userToMove || phase === "error") return;
       if (!displayMoves?.length) {
+        phase = "calculating";
         panel.setStatus("Calculating hint…");
         return;
       }
       showHint();
     }, wait);
+  }
+
+  function failHint(text, error) {
+    console.error(LOG, text, error || "");
+    phase = "error";
+    clearTimeout(hintTimer);
+    clearTimeout(deadlineTimer);
+    panel.setStatus(text, "error");
+  }
+
+  function armDeadline(token) {
+    clearTimeout(deadlineTimer);
+    deadlineTimer = setTimeout(() => {
+      if (token !== searchToken || phase === "error" || phase === "ready" || showing) return;
+      if (!activated || !userToMove || displayMoves?.length) return;
+      failHint("Hint timed out");
+    }, HINT_DEADLINE_MS);
   }
 
   function waitingStatus() {
@@ -241,27 +298,51 @@ function boot() {
     const board = findBoard(document);
     if (!board || !displayMoves?.length || !activated || !userToMove) return;
     showing = true;
+    phase = "ready";
     hintedSignature = lastSignature;
     drawOverlay(board, displayMoves);
+    clearTimeout(deadlineTimer);
     panel.setStatus("Hint ready");
+    console.info(
+      LOG,
+      "hint",
+      displayMoves.map((move) => `${move.uci}${move.label ? ` ${move.label}` : ""}`).join(", "),
+    );
   }
 
   async function searchForUser(fen, token) {
-    const multipv = settings.mode === "human" ? Math.max(settings.lines, HUMAN_POOL) : settings.lines;
-    const pool = await runSearch(fen, multipv, token);
-    if (token !== searchToken || !activated || !userToMove) return;
-    if (!pool?.length) {
-      panel.setStatus("No hint for this position");
-      return;
+    console.info(LOG, "search-start", token, fen);
+    if (token !== searchToken || !activated) return;
+    if (phase === "error") {
+      phase = "calculating";
+      panel.setStatus(waitingStatus());
+      armDeadline(token);
     }
-    lastPool = pool;
-    displayMoves = decorate(pool);
-    if (performance.now() - turnStarted >= settings.hintDelaySec * 1000) showHint();
-    else panel.setStatus(waitingStatus());
+    try {
+      const pool = await runSearch(fen, token);
+      if (token !== searchToken || !activated || !userToMove || phase === "error") return;
+      if (!pool?.length) {
+        failHint("No hint for this position");
+        return;
+      }
+      lastPool = pool;
+      displayMoves = decorate(pool);
+      if (performance.now() - turnStarted >= settings.hintDelaySec * 1000) showHint();
+      else panel.setStatus(waitingStatus());
+    } catch (error) {
+      if (token !== searchToken || !activated || phase === "error") return;
+      failHint(failureText(error), error);
+    }
   }
 
   async function precompute(fen, token) {
-    const opponent = await runSearch(fen, 1, token);
+    let opponent = null;
+    try {
+      opponent = await runSearch(fen, token);
+    } catch (error) {
+      console.error(LOG, "precompute failed", error);
+      return;
+    }
     if (token !== searchToken || !activated || !settings.analyzeOpponent) return;
     if (!opponent?.length) return;
     let replyFen = null;
@@ -278,23 +359,37 @@ function boot() {
     } catch {
       return;
     }
-    const multipv = settings.mode === "human" ? Math.max(settings.lines, HUMAN_POOL) : settings.lines;
-    const replies = await runSearch(replyFen, multipv, token);
+    let replies = null;
+    try {
+      replies = await runSearch(replyFen, token);
+    } catch (error) {
+      console.error(LOG, "precompute reply failed", error);
+      return;
+    }
     if (token !== searchToken || !activated) return;
     if (!replies?.length) return;
     cache = { key: fenKey(replyFen), pool: replies };
   }
 
-  async function runSearch(fen, multipv, token) {
+  async function runSearch(fen, token) {
     if (!activated || token !== searchToken) return null;
-    try {
-      await ensureEngine();
-    } catch (error) {
-      panel.setStatus("Engine unavailable");
-      console.debug("[Chessly] engine start failed", error);
-      return null;
-    }
+    await ensureEngine();
     if (!activated || token !== searchToken || !engine) return null;
+
+    const plan = searchCommands({
+      mode: settings.mode,
+      elo: settings.elo,
+      lines: settings.lines,
+      fen,
+    });
+    console.info(LOG, "search", {
+      mode: settings.mode,
+      elo: settings.elo,
+      depth: plan.plan.depth,
+      uciElo: plan.plan.uciElo,
+      limitStrength: plan.plan.limitStrength,
+      fen,
+    });
 
     const collector = createSearchCollector();
     let accept = false;
@@ -303,41 +398,57 @@ function boot() {
       resolveBest = resolve;
     });
     const onLine = (line) => {
-      if (!accept || token !== searchToken) return;
+      logUci(line);
       if (line.startsWith("id name ")) {
         engineName = line.slice("id name ".length).trim();
         panel.setEngine(engineName);
       }
-      if (line.includes("CRITICAL ERROR")) {
-        resolveBest(null);
+      if (!accept || token !== searchToken) return;
+      if (fatalEngineLine(line)) {
+        resolveBest({ error: line });
         return;
       }
       collector.push(line);
-      if (line.startsWith("bestmove")) resolveBest(collector.finish());
+      if (line.startsWith("bestmove")) resolveBest({ moves: collector.finish(), bestmove: line });
     };
     engine.addHandler(onLine);
     try {
-      const ready = waitForLine(engine, (line) => line.startsWith("readyok"), 2000);
+      const ready = waitForLine(engine, (line) => line.startsWith("readyok") || fatalEngineLine(line), 8000);
       await engine.command(["stop", "isready"], location.href);
-      await ready;
+      const readyLine = await ready;
+      if (!readyLine) throw new Error("readyok-timeout");
+      if (fatalEngineLine(readyLine)) throw new Error(readyLine);
       if (!activated || token !== searchToken) return null;
       accept = true;
-      await engine.command(
-        [
-          `setoption name MultiPV value ${multipv}`,
-          `position fen ${fen}`,
-          `go movetime ${MOVETIME_MS}`,
-        ],
-        location.href,
-      );
-      const result = await Promise.race([
-        finished,
-        delay(MOVETIME_MS + 9000).then(() => null),
-      ]);
-      return token === searchToken ? result : null;
-    } catch (error) {
-      console.debug("[Chessly] search failed", error);
-      return null;
+      await engine.command(plan.commands, location.href);
+      const budget = settings.mode === "human" ? 12000 : BEST_MOVETIME_MS + 8000;
+      let result = await Promise.race([finished, delay(budget).then(() => null)]);
+      if (!result && token === searchToken && engine) {
+        console.info(LOG, "search still running, sending stop");
+        const late = waitForLine(engine, (line) => line.startsWith("bestmove") || fatalEngineLine(line), 4000);
+        try {
+          await engine.command(["stop"], location.href);
+        } catch (error) {
+          console.error(LOG, "stop failed", error);
+        }
+        const stopped = await late;
+        if (typeof stopped === "string" && stopped.startsWith("bestmove")) {
+          result = { moves: collector.finish(), bestmove: stopped };
+        } else if (typeof stopped === "string" && fatalEngineLine(stopped)) {
+          throw new Error(stopped);
+        }
+      }
+      if (token !== searchToken) return null;
+      if (!result) throw new Error("search-timeout");
+      if (result.error) throw new Error(result.error);
+      const bestmove = String(result.bestmove || "");
+      if (/\bbestmove (?:\(none\)|none|0000)\b/.test(bestmove)) throw new Error("no-move");
+      const moves = result.moves?.length
+        ? result.moves
+        : [{ uci: bestmove.split(/\s+/)[1], cp: null, mate: null, multipv: 1, depth: 0, pv: [] }];
+      if (!/^[a-h][1-8][a-h][1-8]/.test(moves[0]?.uci || "")) throw new Error("no-move");
+      console.info(LOG, "bestmove", bestmove);
+      return moves;
     } finally {
       engine?.removeHandler(onLine);
     }
@@ -356,16 +467,28 @@ function boot() {
       if (!activated) throw new Error("inactive");
       await client.start(location.href);
       if (!activated || engine !== client) throw new Error("inactive");
-      const uciok = waitForLine(client, (line) => line.startsWith("uciok"), 15000);
+      const uciok = waitForLine(
+        client,
+        (line) => line.startsWith("uciok") || fatalEngineLine(line),
+        20000,
+      );
       await client.command(["uci"], location.href);
-      await uciok;
+      const uciLine = await uciok;
+      if (!uciLine) throw new Error("uciok-timeout");
+      if (fatalEngineLine(uciLine)) throw new Error(uciLine);
       if (!activated || engine !== client) throw new Error("inactive");
-      const readyok = waitForLine(client, (line) => line.startsWith("readyok"), 15000);
+      const readyok = waitForLine(
+        client,
+        (line) => line.startsWith("readyok") || fatalEngineLine(line),
+        15000,
+      );
       await client.command(
         ["setoption name Hash value 32", "ucinewgame", "isready"],
         location.href,
       );
-      await readyok;
+      const readyLine = await readyok;
+      if (!readyLine) throw new Error("readyok-timeout");
+      if (fatalEngineLine(readyLine)) throw new Error(readyLine);
       if (!activated || engine !== client) throw new Error("inactive");
     })();
     engineReady = ready;
@@ -379,6 +502,14 @@ function boot() {
       }
       throw error;
     }
+  }
+
+  function dropEngine() {
+    searchToken += 1;
+    const closing = engine;
+    engine = null;
+    engineReady = null;
+    if (closing) void closing.stop(location.href);
   }
 
   async function idleEngine() {
@@ -402,7 +533,10 @@ function boot() {
     playingAs = null;
     lastPool = null;
     displayMoves = null;
+    phase = "idle";
     cache = null;
+    positionTracker.reset();
+    clearTimeout(deadlineTimer);
     clearTimeout(hintTimer);
     clearHintVisuals();
     boardObserver?.disconnect();
@@ -447,6 +581,7 @@ function boot() {
     overlay.style.top = `${rect.top}px`;
     overlay.style.width = `${rect.width}px`;
     overlay.style.height = `${rect.height}px`;
+    overlay.dataset.moves = moves.map((move) => move.uci).filter(Boolean).join(",");
     overlay.innerHTML = renderOverlaySvg({
       width: rect.width,
       height: rect.height,
@@ -498,16 +633,18 @@ function boot() {
   panel.onChange(panelPersist);
 }
 
-function readPosition(signals) {
+function readPosition(signals, tracker) {
   const board = findBoard(document);
   if (!board) return null;
   const pieces = readPieceElements(board);
   const signature = pieceSignature(pieces);
+  const placement = basicFromPieces(pieces);
   let apiFen = null;
   let apiTurn = null;
   let apiPlayingAs = null;
+  const gameHost = board.game ? board : board.closest?.("wc-chess-board, chess-board");
   try {
-    const game = board.game;
+    const game = gameHost?.game;
     if (typeof game?.getFEN === "function") apiFen = game.getFEN();
     if (typeof game?.getTurn === "function") apiTurn = normalizeColor(game.getTurn());
     if (typeof game?.getPlayingAs === "function") apiPlayingAs = normalizeColor(game.getPlayingAs());
@@ -515,6 +652,7 @@ function readPosition(signals) {
     /* The internal game object is optional. */
   }
   const flipped = board.classList.contains("flipped");
+  const orientation = boardOrientation(board);
   const highlights = readHighlights(board);
   const moveNodes = readMoveNodes(document);
   const sans = sansFromNodes(moveNodes);
@@ -527,44 +665,47 @@ function readPosition(signals) {
     ),
     flipped,
   });
+  const turnHint = apiTurn || clockTurn || null;
   const extracted = extractFen({
     apiFen,
     pieces,
     highlights,
     sans,
-    turn: apiTurn || clockTurn,
+    turn: turnHint,
   });
-  let playingAs = apiPlayingAs;
-  if (!playingAs) {
-    // Computer games keep the user opposite the bot. When the seat is not in
-    // the DOM yet, chess.com's default layout puts the bot on top.
-    playingAs = inferPlayingAs({ botSeat: signals.botSeat || "top", flipped });
+  const tracked = placement?.basic ? tracker?.note(placement.basic, turnHint || extracted?.turn) : null;
+  let chosen = null;
+  if (extracted && (extracted.source === "api" || extracted.source === "moves")) {
+    tracker?.adopt(extracted.fen);
+    chosen = extracted;
+  } else if (tracked?.fen && !tracked.rejected && !tracked.fresh) {
+    chosen = { fen: tracked.fen, turn: tracked.turn, source: "dom" };
+  } else if (extracted?.fen) {
+    tracker?.adopt(extracted.fen);
+    chosen = extracted;
+  } else if (tracked?.fen && !tracked.rejected) {
+    chosen = { fen: tracked.fen, turn: tracked.turn, source: "dom" };
   }
+  let playingAs = apiPlayingAs;
+  if (!playingAs && signals.botSeat) {
+    playingAs = inferPlayingAs({ botSeat: signals.botSeat, flipped });
+  }
+  // A.C.A.S falls back to board orientation on chess.com: the user sits at the bottom.
+  if (!playingAs) playingAs = orientation;
   return {
     board,
     signature,
-    fen: extracted?.fen || null,
-    turn: extracted?.turn || null,
-    source: extracted?.source || null,
+    fen: chosen?.fen || null,
+    turn: chosen?.turn || null,
+    source: chosen?.source || null,
     playingAs,
     flipped,
+    orientation,
   };
 }
 
 function findBoard(doc) {
-  return (
-    doc.querySelector("wc-chess-board") ||
-    doc.querySelector("chess-board") ||
-    doc.querySelector("#board-play-computer chess-board") ||
-    doc.querySelector("[data-cy='board']")
-  );
-}
-
-function readPieceElements(board) {
-  return [...board.querySelectorAll(".piece")].map((element) => ({
-    className: elementClassName(element),
-    square: element.getAttribute("data-square"),
-  }));
+  return findChessComBoard(doc);
 }
 
 function readHighlights(board) {
@@ -628,6 +769,28 @@ function waitForLine(engine, predicate, timeoutMs, token) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function fatalEngineLine(line) {
+  return (
+    typeof line === "string" &&
+    (line.includes("CRITICAL ERROR") ||
+      line.includes("failed to asynchronously prepare wasm") ||
+      line.startsWith("info string Chessly engine error:"))
+  );
+}
+
+function logUci(line) {
+  if (
+    line.startsWith("bestmove") ||
+    line.startsWith("uciok") ||
+    line.startsWith("readyok") ||
+    line.startsWith("id name") ||
+    line.startsWith("info string") ||
+    /error|failed|CRITICAL/i.test(line)
+  ) {
+    console.info(LOG, "uci <", line);
+  }
 }
 
 function installNavigationHooks(onChange) {
@@ -763,8 +926,10 @@ function createPanel() {
       notice.hidden = true;
       controls.hidden = false;
     },
-    setStatus(text) {
+    setStatus(text, state = "") {
       status.textContent = text || "";
+      if (state) status.dataset.state = state;
+      else delete status.dataset.state;
     },
     setEngine(text) {
       engineLine.textContent = text || "";
