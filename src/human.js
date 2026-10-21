@@ -1,16 +1,9 @@
 /**
- * Human-move selection.
- *
- * Best-move mode shows Stockfish's top line(s). Human-move mode still searches
- * at full strength (so the badge is a real evaluation) and then samples one
- * MultiPV candidate with a softmax over centipawn gaps. The temperature is
- * tied to a Lichess-style Elo, not to Stockfish's UCI_Elo option: that option
- * on this build only accepts 1320–3190 and is a different scale from the slider.
+ * Display helpers. The rating limit itself is in rating.js (A.C.A.S depth and
+ * UCI_LimitStrength). These softmax helpers are not used to pick the hint.
  *
  *   temperature(elo) = 15 + 145 * exp(-(elo - 800) / 700)
  *   weight(move)     = exp(-(bestCp - moveCp) / temperature)
- *
- * Approx. temperatures: 800 → 160cp, 1700 → 55cp, 2500 → 28cp.
  */
 
 export const ELO_MIN = 800;
@@ -44,18 +37,15 @@ export function chooseHumanMove(candidates, elo, rng = Math.random) {
   return candidates[candidates.length - 1];
 }
 
-export function selectDisplayedMoves({ mode, lines, candidates, elo, rng }) {
+/**
+ * Both modes draw engine order. Human-move mode already asked Stockfish for a
+ * rating-limited line (depth and UCI_Elo, same idea as A.C.A.S setEngineElo),
+ * so the first MultiPV line is the move to show.
+ */
+export function selectDisplayedMoves({ lines, candidates }) {
   const pool = (candidates || []).filter((candidate) => typeof candidate?.uci === "string");
   const count = lines === 2 || lines === 3 ? lines : 1;
   if (!pool.length) return [];
-  if (mode === "human") {
-    const chosen = chooseHumanMove(pool, elo, rng) || pool[0];
-    const rest = pool.filter((candidate) => candidate.uci !== chosen.uci);
-    return [chosen, ...rest].slice(0, count).map((candidate, index) => ({
-      ...candidate,
-      emphasis: index === 0 ? "primary" : "secondary",
-    }));
-  }
   return pool.slice(0, count).map((candidate, index) => ({
     ...candidate,
     emphasis: index === 0 ? "primary" : "secondary",

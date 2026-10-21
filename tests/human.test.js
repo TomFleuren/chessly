@@ -45,7 +45,7 @@ describe("human move sampling", () => {
     assert.ok(low < 0.75);
   });
 
-  it("shows the sampled move first and keeps the requested line count", () => {
+  it("shows the engine's first line and keeps the requested line count", () => {
     const shown = selectDisplayedMoves({
       mode: "human",
       lines: 2,
@@ -53,6 +53,7 @@ describe("human move sampling", () => {
       candidates: pool,
       rng: () => 0.99,
     });
+    assert.equal(shown[0].uci, "e2e4");
     assert.equal(shown.length, 2);
     assert.equal(shown[0].emphasis, "primary");
     assert.equal(shown[1].emphasis, "secondary");

@@ -3591,100 +3591,6 @@
     return element;
   }
 
-  // src/engine-client.js
-  function createEngineClient() {
-    const handlers = /* @__PURE__ */ new Set();
-    let mode = null;
-    let worker = null;
-    let started = false;
-    let runtimeListener = null;
-    function emit(line) {
-      for (const handler of handlers) handler(line);
-    }
-    return {
-      get started() {
-        return started;
-      },
-      addHandler(handler) {
-        handlers.add(handler);
-      },
-      removeHandler(handler) {
-        handlers.delete(handler);
-      },
-      async start(pageUrl) {
-        if (started) return;
-        if (typeof chrome !== "undefined" && chrome.offscreen) {
-          runtimeListener = (message) => {
-            if (message?.target !== "content") return;
-            if (message.type === "LINE" && typeof message.line === "string") emit(message.line);
-          };
-          chrome.runtime.onMessage.addListener(runtimeListener);
-          const response = await chrome.runtime.sendMessage({
-            target: "background",
-            source: "content",
-            type: "START",
-            pageUrl
-          });
-          if (!response?.ok) {
-            chrome.runtime.onMessage.removeListener(runtimeListener);
-            runtimeListener = null;
-            throw new Error(response?.reason || "engine-start-failed");
-          }
-          mode = "offscreen";
-          started = true;
-          return;
-        }
-        worker = new Worker(chrome.runtime.getURL("engine/stockfish-19-lite-single.js"));
-        worker.onmessage = (event) => {
-          if (typeof event.data === "string") emit(event.data);
-        };
-        mode = "worker";
-        started = true;
-      },
-      async command(commands, pageUrl) {
-        if (!started) await this.start(pageUrl);
-        if (mode === "offscreen") {
-          const response = await chrome.runtime.sendMessage({
-            target: "background",
-            source: "content",
-            type: "CMD",
-            pageUrl,
-            commands
-          });
-          if (!response?.ok) throw new Error(response?.reason || "engine-cmd-failed");
-          return;
-        }
-        for (const command of commands) worker.postMessage(command);
-      },
-      async stop(pageUrl) {
-        if (!started) return;
-        started = false;
-        handlers.clear();
-        if (mode === "offscreen") {
-          if (runtimeListener) chrome.runtime.onMessage.removeListener(runtimeListener);
-          runtimeListener = null;
-          try {
-            await chrome.runtime.sendMessage({
-              target: "background",
-              source: "content",
-              type: "STOP",
-              pageUrl
-            });
-          } catch {
-          }
-        } else if (worker) {
-          try {
-            worker.postMessage("quit");
-          } catch {
-          }
-          worker.terminate();
-          worker = null;
-        }
-        mode = null;
-      }
-    };
-  }
-
   // src/fen.js
   var PIECE_LETTER = {
     wp: "P",
@@ -3894,46 +3800,421 @@
     return 1;
   }
 
+  // src/chesscom-board.js
+  var START_BASIC = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+  function findChessComBoard(doc) {
+    if (!doc?.querySelector) return null;
+    return doc.querySelector("#board-layout-chessboard > .board") || doc.querySelector("wc-chess-board") || doc.querySelector("chess-board") || doc.querySelector("#board-play-computer chess-board") || doc.querySelector("[data-cy='board']");
+  }
+  function boardOrientation(board) {
+    return board?.classList?.contains("flipped") ? "b" : "w";
+  }
+  function readPieceElements(board) {
+    if (!board?.querySelectorAll) return [];
+    return [...board.querySelectorAll(".piece")].map((element) => ({
+      className: elementClassName(element),
+      square: element.getAttribute?.("data-square") || null
+    }));
+  }
+  function basicFromPieces(elements) {
+    const map = pieceMapFromElements(elements);
+    if (Object.keys(map).length < 2) return null;
+    return { map, basic: placementFromMap(map) };
+  }
+  function createPositionTracker() {
+    let history2 = [];
+    let lostCastling = [];
+    let halfmoveClock = 0;
+    let plyCount = 0;
+    function reset(basic) {
+      history2 = [];
+      lostCastling = [];
+      halfmoveClock = 0;
+      plyCount = 0;
+      seedLostCastling(basic);
+    }
+    function seedLostCastling(basic) {
+      const possible = castlingFromBasic(basic);
+      for (const right of ["K", "Q", "k", "q"]) {
+        if (!possible.includes(right) && !lostCastling.includes(right)) lostCastling.push(right);
+      }
+    }
+    return {
+      reset,
+      current() {
+        return history2[0] || null;
+      },
+      note(basic, turnHint) {
+        if (typeof basic !== "string" || !basic.includes("/")) return history2[0] || null;
+        if (history2[0]?.basic === basic) return history2[0];
+        const previous = history2[0]?.basic || null;
+        const changes = previous ? boardChanges(previous, basic) : emptyChanges();
+        if (previous && changes.pieceAmountChange === -1 && changes.changedSquaresAmount === 1) {
+          return { ...history2[0], rejected: true };
+        }
+        const freshGame = history2.length > 0 && (changes.changedSquaresAmount > 6 || basic === START_BASIC && changes.changedSquaresAmount > 1);
+        const first = !history2.length || freshGame;
+        if (freshGame || !history2.length) reset(basic);
+        const moved = changes.movedPieceColor;
+        let turn = turnHint === "w" || turnHint === "b" ? turnHint : null;
+        if (!turn) {
+          if (moved === "w") turn = "b";
+          else if (moved === "b") turn = "w";
+          else if (!history2.length || freshGame) turn = basic === START_BASIC ? "w" : null;
+          else turn = history2[0]?.turn || null;
+        }
+        if (turn !== "w" && turn !== "b") return history2[0] || null;
+        if (!first) applyRights(changes);
+        const capture = changes.pieceAmountChange === -1 || changes.isEnPassant;
+        const pawnMove = changes.movedPiece?.toLowerCase() === "p";
+        if (first) {
+          halfmoveClock = 0;
+          plyCount = turn === "w" ? 0 : 1;
+        } else {
+          halfmoveClock = capture || pawnMove ? 0 : halfmoveClock + 1;
+          plyCount += 1;
+        }
+        const fullmove = Math.floor(plyCount / 2) + 1;
+        const ep = enPassantTarget(changes);
+        const rights = ["K", "Q", "k", "q"].filter((right) => !lostCastling.includes(right)).join("") || "-";
+        const normalized = normalizeFen(`${basic} ${turn} ${rights} ${ep} 0 ${fullmove}`);
+        if (!normalized) return history2[0] || null;
+        const entry = {
+          basic: normalized.split(" ")[0],
+          fen: normalized.replace(/ \d+ (\d+)$/, ` ${halfmoveClock} $1`),
+          turn: normalized.split(" ")[1],
+          source: "dom",
+          rejected: false,
+          fresh: first
+        };
+        const checked = normalizeFen(entry.fen);
+        if (checked) entry.fen = checked;
+        history2.unshift(entry);
+        return entry;
+      },
+      /** Trust a FEN that already came from the game API or a move-list replay. */
+      adopt(fen) {
+        const normalized = normalizeFen(fen);
+        if (!normalized) return null;
+        if (history2[0]?.fen === normalized) return history2[0];
+        const parts = normalized.split(" ");
+        const basic = parts[0];
+        const turn = parts[1];
+        const rights = parts[2] || "-";
+        reset(basic);
+        lostCastling = ["K", "Q", "k", "q"].filter((right) => rights === "-" || !rights.includes(right));
+        const entry = { basic, fen: normalized, turn, source: "adopted", rejected: false, fresh: false };
+        history2 = [entry];
+        return entry;
+      }
+    };
+    function applyRights(changes) {
+      const piece = changes.movedPiece;
+      const lose = (...rights) => {
+        for (const right of rights) {
+          if (!lostCastling.includes(right)) lostCastling.push(right);
+        }
+      };
+      if (piece === "K") lose("K", "Q");
+      if (piece === "k") lose("k", "q");
+      if (piece === "R" && changes.from === "h1" || changes.capturedPiece === "R" && changes.capturedSquare === "h1") {
+        lose("K");
+      }
+      if (piece === "R" && changes.from === "a1" || changes.capturedPiece === "R" && changes.capturedSquare === "a1") {
+        lose("Q");
+      }
+      if (piece === "r" && changes.from === "h8" || changes.capturedPiece === "r" && changes.capturedSquare === "h8") {
+        lose("k");
+      }
+      if (piece === "r" && changes.from === "a8" || changes.capturedPiece === "r" && changes.capturedSquare === "a8") {
+        lose("q");
+      }
+    }
+  }
+  function castlingFromBasic(basic) {
+    const map = {};
+    const ranks = basic.split("/");
+    ranks.forEach((rank2, index) => {
+      let file2 = 0;
+      for (const char of rank2) {
+        if (char >= "1" && char <= "8") {
+          file2 += Number(char);
+          continue;
+        }
+        map[`${"abcdefgh"[file2]}${8 - index}`] = char;
+        file2 += 1;
+      }
+    });
+    return inferCastling(map);
+  }
+  function emptyChanges() {
+    return {
+      changedSquaresAmount: 0,
+      pieceAmountChange: 0,
+      movedPiece: null,
+      movedPieceColor: null,
+      from: null,
+      to: null,
+      capturedPiece: null,
+      capturedSquare: null,
+      isEnPassant: false
+    };
+  }
+  function boardChanges(previousBasic, nextBasic) {
+    const changes = emptyChanges();
+    const before = expand(previousBasic);
+    const after = expand(nextBasic);
+    const removed = [];
+    const added = [];
+    for (let i = 0; i < 64; i += 1) {
+      if (before[i] === after[i]) continue;
+      changes.changedSquaresAmount += 1;
+      const square = `${"abcdefgh"[i % 8]}${8 - Math.floor(i / 8)}`;
+      if (before[i]) removed.push({ square, piece: before[i] });
+      if (after[i]) added.push({ square, piece: after[i] });
+    }
+    changes.pieceAmountChange = added.length - removed.length;
+    if (removed.length === 2 && added.length === 2) {
+      const kingFrom = removed.find((entry) => entry.piece.toLowerCase() === "k");
+      const kingTo = added.find((entry) => entry.piece.toLowerCase() === "k");
+      if (kingFrom && kingTo) {
+        changes.from = kingFrom.square;
+        changes.to = kingTo.square;
+        changes.movedPiece = kingFrom.piece;
+      }
+    }
+    if (!changes.to && added.length === 1) {
+      const destination = added[0];
+      changes.to = destination.square;
+      const source = removed.find(
+        (entry) => entry.piece === destination.piece && entry.square !== destination.square
+      );
+      if (source) {
+        changes.from = source.square;
+        changes.movedPiece = source.piece;
+      } else if (destination.piece.toLowerCase() !== "p") {
+        const pawn = removed.find((entry) => entry.piece.toLowerCase() === "p");
+        if (pawn) {
+          changes.from = pawn.square;
+          changes.movedPiece = pawn.piece;
+        }
+      }
+    }
+    if (changes.to) {
+      const capture = removed.find((entry) => entry.square === changes.to);
+      if (capture) {
+        changes.capturedPiece = capture.piece;
+        changes.capturedSquare = capture.square;
+      }
+    }
+    if (changes.movedPiece?.toLowerCase() === "p" && removed.length === 2 && added.length === 1 && !changes.capturedPiece) {
+      const capturedPawn = removed.find(
+        (entry) => entry.piece.toLowerCase() === "p" && entry.square !== changes.from
+      );
+      if (capturedPawn) {
+        changes.capturedPiece = capturedPawn.piece;
+        changes.capturedSquare = capturedPawn.square;
+        changes.isEnPassant = true;
+      }
+    }
+    if (changes.movedPiece) {
+      changes.movedPieceColor = changes.movedPiece === changes.movedPiece.toUpperCase() ? "w" : "b";
+    }
+    return changes;
+  }
+  function enPassantTarget(changes) {
+    if (changes.movedPiece?.toLowerCase() !== "p" || !changes.from || !changes.to) return "-";
+    if (changes.from[0] !== changes.to[0]) return "-";
+    if (Math.abs(Number(changes.from[1]) - Number(changes.to[1])) !== 2) return "-";
+    const mid = (Number(changes.from[1]) + Number(changes.to[1])) / 2;
+    return `${changes.from[0]}${mid}`;
+  }
+  function expand(basic) {
+    const squares = [];
+    for (const rank2 of basic.split("/")) {
+      for (const char of rank2) {
+        if (char >= "1" && char <= "8") {
+          for (let i = 0; i < Number(char); i += 1) squares.push("");
+        } else squares.push(char);
+      }
+    }
+    return squares;
+  }
+  function elementClassName(element) {
+    if (typeof element.className === "string") return element.className;
+    return element.getAttribute?.("class") || "";
+  }
+
+  // src/engine-client.js
+  var LOG = "[Chessly]";
+  function canMessageExtension() {
+    return typeof chrome !== "undefined" && Boolean(chrome.runtime?.id) && typeof chrome.runtime?.sendMessage === "function";
+  }
+  function sendExtensionMessage(message, timeoutMs = 8e3) {
+    return new Promise((resolve, reject) => {
+      console.info(LOG, "ipc", message.type);
+      const timer = setTimeout(() => {
+        console.error(LOG, "ipc timeout", message.type);
+        reject(new Error("message-timeout"));
+      }, timeoutMs);
+      try {
+        chrome.runtime.sendMessage(message, (response) => {
+          clearTimeout(timer);
+          const reason = chrome.runtime.lastError?.message;
+          if (reason) reject(new Error(reason));
+          else resolve(response);
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+  }
+  function createEngineClient() {
+    const handlers = /* @__PURE__ */ new Set();
+    let mode = null;
+    let worker = null;
+    let started = false;
+    let runtimeListener = null;
+    function emit(line) {
+      for (const handler of handlers) handler(line);
+    }
+    function attachRuntimeListener() {
+      runtimeListener = (message) => {
+        if (message?.target !== "content") return;
+        if (message.type === "LINE" && typeof message.line === "string") emit(message.line);
+        if (message.type === "ENGINE_ERROR") {
+          const detail = message.detail || "engine error";
+          console.error(LOG, "engine error", detail);
+          emit(`info string Chessly engine error: ${detail}`);
+        }
+      };
+      chrome.runtime.onMessage.addListener(runtimeListener);
+    }
+    return {
+      get started() {
+        return started;
+      },
+      get transport() {
+        return mode;
+      },
+      addHandler(handler) {
+        handlers.add(handler);
+      },
+      removeHandler(handler) {
+        handlers.delete(handler);
+      },
+      async start(pageUrl) {
+        if (started) return mode;
+        if (canMessageExtension()) {
+          attachRuntimeListener();
+          let response;
+          try {
+            response = await sendExtensionMessage({
+              target: "background",
+              source: "content",
+              type: "START",
+              pageUrl
+            });
+          } catch (error) {
+            response = { ok: false, reason: error?.message || "engine-start-failed" };
+          }
+          if (response?.ok) {
+            mode = "offscreen";
+            started = true;
+            console.info(LOG, "engine transport: offscreen");
+            return mode;
+          }
+          chrome.runtime.onMessage.removeListener(runtimeListener);
+          runtimeListener = null;
+          if (response?.reason !== "offscreen-unavailable") {
+            throw new Error(response?.reason || "engine-start-failed");
+          }
+          console.info(LOG, "offscreen API missing, starting a direct worker");
+        }
+        const url = chrome.runtime.getURL("engine/stockfish-19-lite-single.js");
+        const wasm = chrome.runtime.getURL("engine/stockfish-19-lite-single.wasm");
+        console.info(LOG, "engine transport: worker", url);
+        worker = new Worker(`${url}#${encodeURIComponent(wasm)}`);
+        worker.onmessage = (event) => {
+          if (typeof event.data === "string") emit(event.data);
+        };
+        worker.onerror = (event) => {
+          const detail = event?.message || "worker error";
+          console.error(LOG, "worker error", detail);
+          emit(`info string Chessly engine error: ${detail}`);
+        };
+        mode = "worker";
+        started = true;
+        return mode;
+      },
+      async command(commands, pageUrl) {
+        if (!started) await this.start(pageUrl);
+        const list = (commands || []).filter((command) => typeof command === "string" && command);
+        console.info(LOG, "uci >", list.join(" | "));
+        if (mode === "offscreen") {
+          const response = await sendExtensionMessage({
+            target: "background",
+            source: "content",
+            type: "CMD",
+            pageUrl,
+            commands: list
+          });
+          if (!response?.ok) throw new Error(response?.reason || "engine-cmd-failed");
+          return;
+        }
+        for (const command of list) worker.postMessage(command);
+      },
+      async stop(pageUrl) {
+        if (!started) return;
+        started = false;
+        handlers.clear();
+        if (mode === "offscreen") {
+          if (runtimeListener) chrome.runtime.onMessage.removeListener(runtimeListener);
+          runtimeListener = null;
+          try {
+            await sendExtensionMessage({
+              target: "background",
+              source: "content",
+              type: "STOP",
+              pageUrl
+            });
+          } catch {
+          }
+        } else if (worker) {
+          try {
+            worker.postMessage("quit");
+          } catch {
+          }
+          worker.terminate();
+          worker = null;
+        }
+        mode = null;
+      }
+    };
+  }
+
+  // src/hint-status.js
+  function statusMayRefresh(phase) {
+    return phase !== "error" && phase !== "ready";
+  }
+  function failureText(error) {
+    const text = String(error?.message || error || "");
+    if (/uciok-timeout|readyok-timeout|did not respond/i.test(text)) return "Engine did not respond";
+    if (/search-timeout|timed out|Hint timed out/i.test(text)) return "Hint timed out";
+    if (/wasm|failed to (asynchronously )?prepare|worker error|engine-start|offscreen|message-timeout/i.test(text)) {
+      return "Engine failed to start";
+    }
+    if (/CRITICAL ERROR|illegal/i.test(text)) return "Engine rejected the position";
+    if (/no-move|no legal/i.test(text)) return "No hint for this position";
+    return "Engine error";
+  }
+
   // src/human.js
-  var ELO_MIN = 800;
-  var ELO_MAX = 2500;
-  function temperatureForElo(elo) {
-    const clamped = Math.min(ELO_MAX, Math.max(ELO_MIN, Number(elo) || 1700));
-    return 15 + 145 * Math.exp(-(clamped - 800) / 700);
-  }
-  function candidateValue(candidate) {
-    if (candidate?.mate != null && Number.isFinite(candidate.mate)) {
-      return candidate.mate > 0 ? 1e5 - candidate.mate : -1e5 - candidate.mate;
-    }
-    return Number.isFinite(candidate?.cp) ? candidate.cp : 0;
-  }
-  function chooseHumanMove(candidates, elo, rng = Math.random) {
-    if (!candidates?.length) return null;
-    const temperature = temperatureForElo(elo);
-    const values = candidates.map(candidateValue);
-    const best = Math.max(...values);
-    const weights = values.map((value) => Math.exp(-(best - value) / temperature));
-    const sum = weights.reduce((total, weight) => total + weight, 0);
-    if (!Number.isFinite(sum) || sum <= 0) return candidates[0];
-    let roll = rng() * sum;
-    for (let i = 0; i < candidates.length; i += 1) {
-      roll -= weights[i];
-      if (roll <= 0) return candidates[i];
-    }
-    return candidates[candidates.length - 1];
-  }
-  function selectDisplayedMoves({ mode, lines, candidates, elo, rng }) {
+  function selectDisplayedMoves({ lines, candidates }) {
     const pool = (candidates || []).filter((candidate) => typeof candidate?.uci === "string");
     const count = lines === 2 || lines === 3 ? lines : 1;
     if (!pool.length) return [];
-    if (mode === "human") {
-      const chosen = chooseHumanMove(pool, elo, rng) || pool[0];
-      const rest = pool.filter((candidate) => candidate.uci !== chosen.uci);
-      return [chosen, ...rest].slice(0, count).map((candidate, index) => ({
-        ...candidate,
-        emphasis: index === 0 ? "primary" : "secondary"
-      }));
-    }
     return pool.slice(0, count).map((candidate, index) => ({
       ...candidate,
       emphasis: index === 0 ? "primary" : "secondary"
@@ -4067,6 +4348,54 @@
     return Number(value).toFixed(2);
   }
 
+  // src/rating.js
+  var STOCKFISH_ELO_MIN = 1320;
+  var STOCKFISH_ELO_MAX = 3190;
+  var LIMIT_STRENGTH_MAX = 2300;
+  var BEST_MOVETIME_MS = 700;
+  function depthFromElo(elo) {
+    const rating = Number(elo) || 0;
+    if (rating >= 3100) return 18;
+    if (rating >= 3e3) return 16;
+    if (rating >= 2900) return 14;
+    if (rating >= 2800) return 12;
+    if (rating >= 2700) return 10;
+    if (rating >= 2600) return 8;
+    if (rating >= 2400) return 7;
+    if (rating >= 2200) return 6;
+    if (rating >= 2e3) return 5;
+    if (rating >= 1800) return 4;
+    if (rating >= 1600) return 3;
+    if (rating >= 1400) return 2;
+    return 1;
+  }
+  function strengthPlan(elo) {
+    const rating = Math.round(Number(elo) || 0);
+    const depth = depthFromElo(rating);
+    const uciElo = rating >= STOCKFISH_ELO_MIN && rating <= STOCKFISH_ELO_MAX ? rating : null;
+    return {
+      depth,
+      uciElo,
+      limitStrength: uciElo != null && rating > 0 && rating <= LIMIT_STRENGTH_MAX
+    };
+  }
+  function searchCommands({ mode, elo, lines, fen }) {
+    const count = lines === 2 || lines === 3 ? lines : 1;
+    const plan = strengthPlan(elo);
+    const commands = ["setoption name UCI_LimitStrength value false"];
+    if (mode === "human" && plan.uciElo != null) {
+      commands.push(`setoption name UCI_Elo value ${plan.uciElo}`);
+      commands.push(
+        `setoption name UCI_LimitStrength value ${plan.limitStrength ? "true" : "false"}`
+      );
+    }
+    commands.push(`setoption name MultiPV value ${count}`);
+    commands.push(`position fen ${fen}`);
+    if (mode === "human") commands.push(`go depth ${plan.depth}`);
+    else commands.push(`go movetime ${BEST_MOVETIME_MS}`);
+    return { commands, plan, multipv: count };
+  }
+
   // src/settings.js
   var STORAGE_KEY = "chessly-settings";
   var DEFAULT_SETTINGS = Object.freeze({
@@ -4165,9 +4494,9 @@
   }
 
   // src/content/content.js
-  var MOVETIME_MS = 700;
-  var HUMAN_POOL = 5;
+  var LOG2 = "[Chessly]";
   var START_PLACEMENT2 = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+  var HINT_DEADLINE_MS = 25e3;
   if (!globalThis.__CHESSLY_BOOTED__) {
     globalThis.__CHESSLY_BOOTED__ = true;
     boot();
@@ -4193,6 +4522,7 @@
     let lastPool = null;
     let displayMoves = null;
     let showing = false;
+    let phase = "idle";
     let overlay = null;
     let trackRaf = 0;
     let boardObserver = null;
@@ -4221,12 +4551,22 @@
     chrome.runtime?.onMessage.addListener((message) => {
       if (message?.target !== "content") return;
       if (message.type === "DEACTIVATE") deactivate();
-      if (message.type === "ENGINE_ERROR") panel.setStatus("Engine restarted");
+      if (message.type === "ENGINE_ERROR") {
+        console.error(LOG2, "engine:", message.detail || "unknown");
+        dropEngine();
+        if (activated && userToMove && phase !== "ready") {
+          failHint(failureText(message.detail || "engine error"), message.detail);
+        }
+      }
     });
+    const positionTracker = createPositionTracker();
+    let lastGateKey = "";
+    let deadlineTimer = 0;
+    let cache = null;
     installNavigationHooks(() => reconcile());
     const pollTimer = setInterval(() => reconcile(), 250);
     const statusTimer = setInterval(() => {
-      if (!activated || !userToMove || showing) return;
+      if (!activated || !statusMayRefresh(phase) || !userToMove || showing) return;
       panel.setStatus(waitingStatus());
     }, 250);
     window.addEventListener("pagehide", () => {
@@ -4238,6 +4578,15 @@
     function reconcile() {
       const signals = readDomSignals(document);
       const gate = classifySignals({ url: location.href, ...signals });
+      const gateKey = `${gate.activate}|${gate.reason}|${location.pathname}`;
+      if (gateKey !== lastGateKey) {
+        lastGateKey = gateKey;
+        console.info(LOG2, "gate", gate.reason, location.href, {
+          bot: signals.hasBotMarker,
+          human: signals.hasHumanMarker,
+          botSeat: signals.botSeat
+        });
+      }
       if (!gate.activate) {
         deactivate();
         return;
@@ -4247,7 +4596,7 @@
         panel.showActive();
         panel.apply(settings);
       }
-      const position = readPosition(signals);
+      const position = readPosition(signals, positionTracker);
       if (!position) return;
       if (position.signature !== lastSignature) {
         lastSignature = position.signature;
@@ -4270,16 +4619,30 @@
       lastPool = null;
       displayMoves = null;
       hintedSignature = "";
+      phase = "idle";
       clearHintVisuals();
       userToMove = Boolean(playingAs) && position.turn === playingAs;
+      console.info(LOG2, "position", {
+        fen: position.fen,
+        source: position.source,
+        turn: position.turn,
+        playingAs,
+        orientation: position.orientation,
+        userToMove,
+        mode: settings.mode,
+        elo: settings.elo
+      });
       if (!userToMove) {
         turnStarted = 0;
+        phase = "idle";
         panel.setStatus(playingAs ? "Opponent's turn" : "Detecting your color\u2026");
         if (settings.analyzeOpponent && playingAs) void precompute(position.fen, searchToken);
         else void idleEngine();
         return;
       }
+      phase = "countdown";
       turnStarted = performance.now();
+      armDeadline(searchToken);
       const cached = cacheHit(position.fen);
       if (cached) {
         lastPool = cached;
@@ -4292,7 +4655,6 @@
       scheduleHint();
       void searchForUser(position.fen, searchToken);
     }
-    let cache = null;
     function cacheHit(fen) {
       if (!cache || cache.key !== fenKey(fen)) return null;
       return cache.pool;
@@ -4333,16 +4695,32 @@
     }
     function scheduleHint() {
       clearTimeout(hintTimer);
-      if (!activated || !userToMove) return;
+      if (!activated || !userToMove || phase === "error") return;
       const wait = Math.max(0, settings.hintDelaySec * 1e3 - (performance.now() - turnStarted));
       hintTimer = setTimeout(() => {
-        if (!activated || !userToMove) return;
+        if (!activated || !userToMove || phase === "error") return;
         if (!displayMoves?.length) {
+          phase = "calculating";
           panel.setStatus("Calculating hint\u2026");
           return;
         }
         showHint();
       }, wait);
+    }
+    function failHint(text, error) {
+      console.error(LOG2, text, error || "");
+      phase = "error";
+      clearTimeout(hintTimer);
+      clearTimeout(deadlineTimer);
+      panel.setStatus(text, "error");
+    }
+    function armDeadline(token) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = setTimeout(() => {
+        if (token !== searchToken || phase === "error" || phase === "ready" || showing) return;
+        if (!activated || !userToMove || displayMoves?.length) return;
+        failHint("Hint timed out");
+      }, HINT_DEADLINE_MS);
     }
     function waitingStatus() {
       const remain = Math.ceil(
@@ -4356,25 +4734,49 @@
       const board = findBoard(document);
       if (!board || !displayMoves?.length || !activated || !userToMove) return;
       showing = true;
+      phase = "ready";
       hintedSignature = lastSignature;
       drawOverlay(board, displayMoves);
+      clearTimeout(deadlineTimer);
       panel.setStatus("Hint ready");
+      console.info(
+        LOG2,
+        "hint",
+        displayMoves.map((move) => `${move.uci}${move.label ? ` ${move.label}` : ""}`).join(", ")
+      );
     }
     async function searchForUser(fen, token) {
-      const multipv = settings.mode === "human" ? Math.max(settings.lines, HUMAN_POOL) : settings.lines;
-      const pool = await runSearch(fen, multipv, token);
-      if (token !== searchToken || !activated || !userToMove) return;
-      if (!pool?.length) {
-        panel.setStatus("No hint for this position");
-        return;
+      console.info(LOG2, "search-start", token, fen);
+      if (token !== searchToken || !activated) return;
+      if (phase === "error") {
+        phase = "calculating";
+        panel.setStatus(waitingStatus());
+        armDeadline(token);
       }
-      lastPool = pool;
-      displayMoves = decorate(pool);
-      if (performance.now() - turnStarted >= settings.hintDelaySec * 1e3) showHint();
-      else panel.setStatus(waitingStatus());
+      try {
+        const pool = await runSearch(fen, token);
+        if (token !== searchToken || !activated || !userToMove || phase === "error") return;
+        if (!pool?.length) {
+          failHint("No hint for this position");
+          return;
+        }
+        lastPool = pool;
+        displayMoves = decorate(pool);
+        if (performance.now() - turnStarted >= settings.hintDelaySec * 1e3) showHint();
+        else panel.setStatus(waitingStatus());
+      } catch (error) {
+        if (token !== searchToken || !activated || phase === "error") return;
+        failHint(failureText(error), error);
+      }
     }
     async function precompute(fen, token) {
-      const opponent = await runSearch(fen, 1, token);
+      let opponent = null;
+      try {
+        opponent = await runSearch(fen, token);
+      } catch (error) {
+        console.error(LOG2, "precompute failed", error);
+        return;
+      }
       if (token !== searchToken || !activated || !settings.analyzeOpponent) return;
       if (!opponent?.length) return;
       let replyFen = null;
@@ -4391,22 +4793,35 @@
       } catch {
         return;
       }
-      const multipv = settings.mode === "human" ? Math.max(settings.lines, HUMAN_POOL) : settings.lines;
-      const replies = await runSearch(replyFen, multipv, token);
+      let replies = null;
+      try {
+        replies = await runSearch(replyFen, token);
+      } catch (error) {
+        console.error(LOG2, "precompute reply failed", error);
+        return;
+      }
       if (token !== searchToken || !activated) return;
       if (!replies?.length) return;
       cache = { key: fenKey(replyFen), pool: replies };
     }
-    async function runSearch(fen, multipv, token) {
+    async function runSearch(fen, token) {
       if (!activated || token !== searchToken) return null;
-      try {
-        await ensureEngine();
-      } catch (error) {
-        panel.setStatus("Engine unavailable");
-        console.debug("[Chessly] engine start failed", error);
-        return null;
-      }
+      await ensureEngine();
       if (!activated || token !== searchToken || !engine) return null;
+      const plan = searchCommands({
+        mode: settings.mode,
+        elo: settings.elo,
+        lines: settings.lines,
+        fen
+      });
+      console.info(LOG2, "search", {
+        mode: settings.mode,
+        elo: settings.elo,
+        depth: plan.plan.depth,
+        uciElo: plan.plan.uciElo,
+        limitStrength: plan.plan.limitStrength,
+        fen
+      });
       const collector = createSearchCollector();
       let accept = false;
       let resolveBest = null;
@@ -4414,41 +4829,55 @@
         resolveBest = resolve;
       });
       const onLine = (line) => {
-        if (!accept || token !== searchToken) return;
+        logUci(line);
         if (line.startsWith("id name ")) {
           engineName = line.slice("id name ".length).trim();
           panel.setEngine(engineName);
         }
-        if (line.includes("CRITICAL ERROR")) {
-          resolveBest(null);
+        if (!accept || token !== searchToken) return;
+        if (fatalEngineLine(line)) {
+          resolveBest({ error: line });
           return;
         }
         collector.push(line);
-        if (line.startsWith("bestmove")) resolveBest(collector.finish());
+        if (line.startsWith("bestmove")) resolveBest({ moves: collector.finish(), bestmove: line });
       };
       engine.addHandler(onLine);
       try {
-        const ready = waitForLine(engine, (line) => line.startsWith("readyok"), 2e3);
+        const ready = waitForLine(engine, (line) => line.startsWith("readyok") || fatalEngineLine(line), 8e3);
         await engine.command(["stop", "isready"], location.href);
-        await ready;
+        const readyLine = await ready;
+        if (!readyLine) throw new Error("readyok-timeout");
+        if (fatalEngineLine(readyLine)) throw new Error(readyLine);
         if (!activated || token !== searchToken) return null;
         accept = true;
-        await engine.command(
-          [
-            `setoption name MultiPV value ${multipv}`,
-            `position fen ${fen}`,
-            `go movetime ${MOVETIME_MS}`
-          ],
-          location.href
-        );
-        const result = await Promise.race([
-          finished,
-          delay(MOVETIME_MS + 9e3).then(() => null)
-        ]);
-        return token === searchToken ? result : null;
-      } catch (error) {
-        console.debug("[Chessly] search failed", error);
-        return null;
+        await engine.command(plan.commands, location.href);
+        const budget = settings.mode === "human" ? 12e3 : BEST_MOVETIME_MS + 8e3;
+        let result = await Promise.race([finished, delay(budget).then(() => null)]);
+        if (!result && token === searchToken && engine) {
+          console.info(LOG2, "search still running, sending stop");
+          const late = waitForLine(engine, (line) => line.startsWith("bestmove") || fatalEngineLine(line), 4e3);
+          try {
+            await engine.command(["stop"], location.href);
+          } catch (error) {
+            console.error(LOG2, "stop failed", error);
+          }
+          const stopped = await late;
+          if (typeof stopped === "string" && stopped.startsWith("bestmove")) {
+            result = { moves: collector.finish(), bestmove: stopped };
+          } else if (typeof stopped === "string" && fatalEngineLine(stopped)) {
+            throw new Error(stopped);
+          }
+        }
+        if (token !== searchToken) return null;
+        if (!result) throw new Error("search-timeout");
+        if (result.error) throw new Error(result.error);
+        const bestmove = String(result.bestmove || "");
+        if (/\bbestmove (?:\(none\)|none|0000)\b/.test(bestmove)) throw new Error("no-move");
+        const moves = result.moves?.length ? result.moves : [{ uci: bestmove.split(/\s+/)[1], cp: null, mate: null, multipv: 1, depth: 0, pv: [] }];
+        if (!/^[a-h][1-8][a-h][1-8]/.test(moves[0]?.uci || "")) throw new Error("no-move");
+        console.info(LOG2, "bestmove", bestmove);
+        return moves;
       } finally {
         engine?.removeHandler(onLine);
       }
@@ -4466,16 +4895,28 @@
         if (!activated) throw new Error("inactive");
         await client.start(location.href);
         if (!activated || engine !== client) throw new Error("inactive");
-        const uciok = waitForLine(client, (line) => line.startsWith("uciok"), 15e3);
+        const uciok = waitForLine(
+          client,
+          (line) => line.startsWith("uciok") || fatalEngineLine(line),
+          2e4
+        );
         await client.command(["uci"], location.href);
-        await uciok;
+        const uciLine = await uciok;
+        if (!uciLine) throw new Error("uciok-timeout");
+        if (fatalEngineLine(uciLine)) throw new Error(uciLine);
         if (!activated || engine !== client) throw new Error("inactive");
-        const readyok = waitForLine(client, (line) => line.startsWith("readyok"), 15e3);
+        const readyok = waitForLine(
+          client,
+          (line) => line.startsWith("readyok") || fatalEngineLine(line),
+          15e3
+        );
         await client.command(
           ["setoption name Hash value 32", "ucinewgame", "isready"],
           location.href
         );
-        await readyok;
+        const readyLine = await readyok;
+        if (!readyLine) throw new Error("readyok-timeout");
+        if (fatalEngineLine(readyLine)) throw new Error(readyLine);
         if (!activated || engine !== client) throw new Error("inactive");
       })();
       engineReady = ready;
@@ -4489,6 +4930,13 @@
         }
         throw error;
       }
+    }
+    function dropEngine() {
+      searchToken += 1;
+      const closing = engine;
+      engine = null;
+      engineReady = null;
+      if (closing) void closing.stop(location.href);
     }
     async function idleEngine() {
       if (!engine?.started) return;
@@ -4509,7 +4957,10 @@
       playingAs = null;
       lastPool = null;
       displayMoves = null;
+      phase = "idle";
       cache = null;
+      positionTracker.reset();
+      clearTimeout(deadlineTimer);
       clearTimeout(hintTimer);
       clearHintVisuals();
       boardObserver?.disconnect();
@@ -4552,6 +5003,7 @@
       overlay.style.top = `${rect.top}px`;
       overlay.style.width = `${rect.width}px`;
       overlay.style.height = `${rect.height}px`;
+      overlay.dataset.moves = moves.map((move) => move.uci).filter(Boolean).join(",");
       overlay.innerHTML = renderOverlaySvg({
         width: rect.width,
         height: rect.height,
@@ -4598,22 +5050,25 @@
     }
     panel.onChange(panelPersist);
   }
-  function readPosition(signals) {
+  function readPosition(signals, tracker) {
     const board = findBoard(document);
     if (!board) return null;
     const pieces = readPieceElements(board);
     const signature = pieceSignature(pieces);
+    const placement = basicFromPieces(pieces);
     let apiFen = null;
     let apiTurn = null;
     let apiPlayingAs = null;
+    const gameHost = board.game ? board : board.closest?.("wc-chess-board, chess-board");
     try {
-      const game = board.game;
+      const game = gameHost?.game;
       if (typeof game?.getFEN === "function") apiFen = game.getFEN();
       if (typeof game?.getTurn === "function") apiTurn = normalizeColor(game.getTurn());
       if (typeof game?.getPlayingAs === "function") apiPlayingAs = normalizeColor(game.getPlayingAs());
     } catch {
     }
     const flipped = board.classList.contains("flipped");
+    const orientation = boardOrientation(board);
     const highlights = readHighlights(board);
     const moveNodes = readMoveNodes(document);
     const sans = sansFromNodes(moveNodes);
@@ -4626,40 +5081,50 @@
       ),
       flipped
     });
+    const turnHint = apiTurn || clockTurn || null;
     const extracted = extractFen({
       apiFen,
       pieces,
       highlights,
       sans,
-      turn: apiTurn || clockTurn
+      turn: turnHint
     });
-    let playingAs = apiPlayingAs;
-    if (!playingAs) {
-      playingAs = inferPlayingAs({ botSeat: signals.botSeat || "top", flipped });
+    const tracked = placement?.basic ? tracker?.note(placement.basic, turnHint || extracted?.turn) : null;
+    let chosen = null;
+    if (extracted && (extracted.source === "api" || extracted.source === "moves")) {
+      tracker?.adopt(extracted.fen);
+      chosen = extracted;
+    } else if (tracked?.fen && !tracked.rejected && !tracked.fresh) {
+      chosen = { fen: tracked.fen, turn: tracked.turn, source: "dom" };
+    } else if (extracted?.fen) {
+      tracker?.adopt(extracted.fen);
+      chosen = extracted;
+    } else if (tracked?.fen && !tracked.rejected) {
+      chosen = { fen: tracked.fen, turn: tracked.turn, source: "dom" };
     }
+    let playingAs = apiPlayingAs;
+    if (!playingAs && signals.botSeat) {
+      playingAs = inferPlayingAs({ botSeat: signals.botSeat, flipped });
+    }
+    if (!playingAs) playingAs = orientation;
     return {
       board,
       signature,
-      fen: extracted?.fen || null,
-      turn: extracted?.turn || null,
-      source: extracted?.source || null,
+      fen: chosen?.fen || null,
+      turn: chosen?.turn || null,
+      source: chosen?.source || null,
       playingAs,
-      flipped
+      flipped,
+      orientation
     };
   }
   function findBoard(doc) {
-    return doc.querySelector("wc-chess-board") || doc.querySelector("chess-board") || doc.querySelector("#board-play-computer chess-board") || doc.querySelector("[data-cy='board']");
-  }
-  function readPieceElements(board) {
-    return [...board.querySelectorAll(".piece")].map((element) => ({
-      className: elementClassName(element),
-      square: element.getAttribute("data-square")
-    }));
+    return findChessComBoard(doc);
   }
   function readHighlights(board) {
     const squares = [];
     for (const element of board.querySelectorAll(".highlight")) {
-      const fromClass = squareFromClass(elementClassName(element));
+      const fromClass = squareFromClass(elementClassName2(element));
       const fromData = element.getAttribute("data-square");
       if (fromClass) squares.push(fromClass);
       if (fromData && /^[a-h][1-8]$/.test(fromData)) squares.push(fromData);
@@ -4684,7 +5149,7 @@
     }
     return [];
   }
-  function elementClassName(element) {
+  function elementClassName2(element) {
     if (typeof element.className === "string") return element.className;
     return element.getAttribute?.("class") || "";
   }
@@ -4712,6 +5177,14 @@
   }
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  function fatalEngineLine(line) {
+    return typeof line === "string" && (line.includes("CRITICAL ERROR") || line.includes("failed to asynchronously prepare wasm") || line.startsWith("info string Chessly engine error:"));
+  }
+  function logUci(line) {
+    if (line.startsWith("bestmove") || line.startsWith("uciok") || line.startsWith("readyok") || line.startsWith("id name") || line.startsWith("info string") || /error|failed|CRITICAL/i.test(line)) {
+      console.info(LOG2, "uci <", line);
+    }
   }
   function installNavigationHooks(onChange) {
     const fire = () => onChange();
@@ -4835,8 +5308,10 @@
         notice.hidden = true;
         controls.hidden = false;
       },
-      setStatus(text) {
+      setStatus(text, state = "") {
         status.textContent = text || "";
+        if (state) status.dataset.state = state;
+        else delete status.dataset.state;
       },
       setEngine(text) {
         engineLine.textContent = text || "";

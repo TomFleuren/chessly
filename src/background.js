@@ -1,7 +1,47 @@
 import { engineRequestAllowed, isBotGameUrl } from "./allowlist.js";
 
+const LOG = "[Chessly]";
 let engineTabId = null;
 let engineGeneration = 0;
+
+const tabRestore = chrome.storage?.session
+  ? chrome.storage.session.get("chesslyEngineTab").then((data) => {
+      if (engineTabId == null && typeof data?.chesslyEngineTab === "number") {
+        engineTabId = data.chesslyEngineTab;
+      }
+    })
+  : Promise.resolve();
+
+function rememberTab(tabId) {
+  engineTabId = tabId;
+  chrome.storage?.session?.set({ chesslyEngineTab: tabId }).catch(() => {});
+}
+
+function forgetTab() {
+  engineTabId = null;
+  chrome.storage?.session?.remove("chesslyEngineTab").catch(() => {});
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function sendToOffscreen(message, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("offscreen-timeout")), timeoutMs);
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        clearTimeout(timer);
+        const reason = chrome.runtime.lastError?.message;
+        if (reason) reject(new Error(reason));
+        else resolve(response);
+      });
+    } catch (error) {
+      clearTimeout(timer);
+      reject(error);
+    }
+  });
+}
 
 function requestAllowed(sender, message) {
   return engineRequestAllowed({
@@ -20,18 +60,37 @@ async function ensureOffscreen() {
     throw new Error("offscreen-unavailable");
   }
   if (await offscreenOpen()) return;
-  await chrome.offscreen.createDocument({
-    url: "dist/offscreen.html",
-    reasons: ["WORKERS"],
-    justification: "Run the local Stockfish worker for hints in chess.com bot games.",
-  });
+  try {
+    await chrome.offscreen.createDocument({
+      url: "dist/offscreen.html",
+      reasons: ["WORKERS"],
+      justification: "Run the local Stockfish worker for hints in chess.com bot games.",
+    });
+  } catch (error) {
+    if (!(await offscreenOpen())) throw error;
+  }
+}
+
+async function pingOffscreen() {
+  const deadline = Date.now() + 5000;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const response = await sendToOffscreen({ target: "offscreen", type: "PING" }, 1000);
+      if (response?.ok) return;
+    } catch (error) {
+      lastError = error;
+    }
+    await delay(40);
+  }
+  throw new Error(lastError?.message || "offscreen-not-ready");
 }
 
 async function closeEngine() {
   engineGeneration += 1;
-  engineTabId = null;
+  forgetTab();
   try {
-    await chrome.runtime.sendMessage({ target: "offscreen", type: "SHUTDOWN" });
+    await sendToOffscreen({ target: "offscreen", type: "SHUTDOWN" }, 1500);
   } catch {
     /* The offscreen document may already be closed. */
   }
@@ -67,22 +126,35 @@ function watchUrl(tabId, url) {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || message.target !== "background") return undefined;
+  if (message.source !== "offscreen") {
+    console.info(LOG, "background", message.type, sender.tab?.url || "");
+  }
 
   if (message.source === "offscreen") {
-    if (engineTabId == null) return undefined;
-    if (message.type === "LINE") {
-      chrome.tabs
-        .sendMessage(engineTabId, { target: "content", type: "LINE", line: message.line })
-        .catch(() => {});
-    } else if (message.type === "ENGINE_ERROR") {
-      chrome.tabs
-        .sendMessage(engineTabId, {
-          target: "content",
-          type: "ENGINE_ERROR",
-          detail: message.detail || "",
-        })
-        .catch(() => {});
+    const forward = () => {
+      if (engineTabId == null) return;
+      if (message.type === "LINE") {
+        chrome.tabs
+          .sendMessage(engineTabId, { target: "content", type: "LINE", line: message.line })
+          .catch(() => {});
+      } else if (message.type === "ENGINE_ERROR") {
+        console.error(LOG, "engine error", message.detail || "");
+        chrome.tabs
+          .sendMessage(engineTabId, {
+            target: "content",
+            type: "ENGINE_ERROR",
+            detail: message.detail || "",
+          })
+          .catch(() => {});
+      }
+    };
+    if (message.type === "READY") {
+      console.info(LOG, "offscreen ready");
+      forward();
+    } else {
+      tabRestore.then(forward);
     }
+    sendResponse({ ok: true });
     return undefined;
   }
 
@@ -104,7 +176,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "START") {
     const generation = engineGeneration;
     const tabId = sender.tab.id;
-    engineTabId = tabId;
+    rememberTab(tabId);
     ensureOffscreen()
       .then(async () => {
         if (generation !== engineGeneration) {
@@ -116,9 +188,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, reason: "not-bot-page" });
           return;
         }
-        sendResponse({ ok: true });
+        await pingOffscreen();
+        console.info(LOG, "engine started for tab", tabId);
+        sendResponse({ ok: true, transport: "offscreen" });
       })
-      .catch((error) => sendResponse({ ok: false, reason: String(error?.message || error) }));
+      .catch((error) => {
+        console.error(LOG, "engine start failed", error?.message || error);
+        sendResponse({ ok: false, reason: String(error?.message || error) });
+      });
     return true;
   }
 
@@ -134,7 +211,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       : [];
     const generation = engineGeneration;
     const tabId = sender.tab.id;
-    engineTabId = tabId;
+    rememberTab(tabId);
     ensureOffscreen()
       .then(async () => {
         if (generation !== engineGeneration) {
@@ -146,10 +223,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           sendResponse({ ok: false, reason: "not-bot-page" });
           return;
         }
-        await chrome.runtime.sendMessage({ target: "offscreen", type: "CMD", commands });
+        await pingOffscreen();
+        const response = await sendToOffscreen({ target: "offscreen", type: "CMD", commands });
+        if (!response?.ok) throw new Error(response?.reason || "engine-cmd-failed");
         sendResponse({ ok: true });
       })
-      .catch((error) => sendResponse({ ok: false, reason: String(error?.message || error) }));
+      .catch((error) => {
+        console.error(LOG, "engine command failed", error?.message || error);
+        sendResponse({ ok: false, reason: String(error?.message || error) });
+      });
     return true;
   }
 
